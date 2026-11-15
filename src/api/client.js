@@ -26,11 +26,12 @@ export function newKey() {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function send(path, { method, body, form, idempotencyKey }) {
+function send(path, { method, body, form, idempotencyKey, recoveryAuthorization }) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (UNSAFE_METHODS.has(method) && csrfToken) headers['X-CSRF-Token'] = csrfToken;
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+  if (recoveryAuthorization) headers['X-Teachmi-Recovery-Authorization'] = recoveryAuthorization;
 
   return fetch(`${API_BASE}${path}`, {
     method,
@@ -40,10 +41,10 @@ function send(path, { method, body, form, idempotencyKey }) {
   });
 }
 
-export async function request(path, { method = 'GET', body, form, idempotencyKey, retried = false } = {}) {
+export async function request(path, { method = 'GET', body, form, idempotencyKey, recoveryAuthorization, retried = false } = {}) {
   let response;
   try {
-    response = await send(path, { method, body, form, idempotencyKey });
+    response = await send(path, { method, body, form, idempotencyKey, recoveryAuthorization });
   } catch {
     throw new ApiError(0, 'NETWORK');
   }
@@ -59,7 +60,7 @@ export async function request(path, { method = 'GET', body, form, idempotencyKey
       const me = await request('/auth/me').catch(() => null);
       if (me?.csrfToken) {
         csrfToken = me.csrfToken;
-        return request(path, { method, body, form, idempotencyKey, retried: true });
+        return request(path, { method, body, form, idempotencyKey, recoveryAuthorization, retried: true });
       }
     }
     const reference = response.headers.get('X-Teachmi-Request-Id');

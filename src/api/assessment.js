@@ -8,11 +8,23 @@ export function startProblems(sessionId) {
   return request(`/sessions/${sessionId}/problems`, { method: 'POST' });
 }
 
-export function submitAttempt(sessionId, problemId, { answer, work }, idempotencyKey) {
+export function submitAttempt(sessionId, problemId, { answer, work }, idempotencyKey, recoveryAuthorization) {
   return request(`/sessions/${sessionId}/problems/${problemId}/attempts`, {
     method: 'POST',
     body: { answer, work },
     idempotencyKey,
+    recoveryAuthorization,
+  });
+}
+
+// Both requests are free of AI generation. A later explicit submit consumes consent at most once.
+export function getGradingRecovery(sessionId) {
+  return request(`/sessions/${sessionId}/grading-recovery`);
+}
+
+export function consentGradingRecovery(sessionId, attemptId) {
+  return request(`/sessions/${sessionId}/grading-recovery/consent`, {
+    method: 'POST', body: { attemptId, acceptDuplicateCall: true },
   });
 }
 

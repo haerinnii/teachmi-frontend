@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Navigate, useNavigate } from 'react-router';
-import { startProblemReteach, startProblems, submitAttempt, viewSolution } from '../../api/assessment';
+import { consentGradingRecovery, getGradingRecovery, startProblemReteach, startProblems, submitAttempt, viewSolution } from '../../api/assessment';
 import { newKey } from '../../api/client';
 import { canRetrySame, isTerminal, messageFor } from '../../api/errors';
 import { getSession } from '../../api/sessions';
@@ -39,7 +39,11 @@ export default function LiveProblem({ session, subject }) {
   const [submittedAnswer, setSubmittedAnswer] = useState('');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
-  const [blocked, setBlocked] = useState(false);
+  const [blocked, setBlocked] = useState(Boolean(session.recovery));
+  const [checkingRecovery, setCheckingRecovery] = useState(true);
+  const [recovery, setRecovery] = useState(null);
+  const [retryOpen, setRetryOpen] = useState(false);
+  const sendingRef = useRef(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const submitRef = useRef(null);
   const reteachKeyRef = useRef(null);
@@ -53,6 +57,8 @@ export default function LiveProblem({ session, subject }) {
   }
 
   async function begin() {
+    if (sendingRef.current || blocked || checkingRecovery || recovery?.savedSubmission) return;
+    sendingRef.current = true;
     setError('');
     setBusy('문제를 만들고 있어요...');
     try {
@@ -66,9 +72,54 @@ export default function LiveProblem({ session, subject }) {
       fail(err, '문제를 만들지 못했어요. 잠시 후 다시 시도해 주세요.');
       if (resuming) setPhase('intro');
     } finally {
+      sendingRef.current = false;
       setBusy('');
     }
   }
+
+  const restoreRecovery = useCallback((saved) => {
+    if (resuming && saved?.state === 'completed') {
+      setRecovery(null);
+      setBlocked(false);
+      return;
+    }
+    setRecovery(saved);
+    if (!saved?.savedSubmission) {
+      if (!session.recovery) { setBlocked(false); setError(''); }
+      return;
+    }
+    setProblems(saved.problems);
+    setIndex(Math.max(0, saved.problems.findIndex((item) => item.problemId === saved.problemId)));
+    setAnswer(saved.savedSubmission.answer);
+    setWork(saved.savedSubmission.work);
+    submitRef.current = { key: saved.savedSubmission.idempotencyKey };
+    setBlocked(true);
+    setPhase('solve');
+    setError('');
+  }, [resuming, session.recovery]);
+
+  async function checkRecovery() {
+    if (sendingRef.current) return;
+    setCheckingRecovery(true);
+    try {
+      restoreRecovery(await getGradingRecovery(session.sessionId));
+    } catch (err) {
+      fail(err, '저장 상태를 확인하지 못했어요. 상태 확인 후 진행해 주세요.');
+      setBlocked(true);
+    } finally { setCheckingRecovery(false); }
+  }
+
+  useEffect(() => {
+    let active = true;
+    getGradingRecovery(session.sessionId).then((saved) => {
+      if (active) restoreRecovery(saved);
+    }).catch((err) => {
+      if (!active) return;
+      setError(messageFor(err, '저장 상태를 확인하지 못했어요. 상태 확인 후 진행해 주세요.'));
+      setBlocked(true);
+    }).finally(() => { if (active) setCheckingRecovery(false); });
+    return () => { active = false; };
+  }, [session.sessionId, restoreRecovery]);
 
   const beginRef = useRef(begin);
   useEffect(() => {
@@ -76,8 +127,8 @@ export default function LiveProblem({ session, subject }) {
   });
 
   useEffect(() => {
-    if (resuming) beginRef.current();
-  }, [resuming]);
+    if (resuming && !checkingRecovery && !recovery?.savedSubmission) beginRef.current();
+  }, [resuming, checkingRecovery, recovery]);
 
   function goToReport() {
     navigate('/learn/report', { state: { session, subject } });
@@ -89,6 +140,8 @@ export default function LiveProblem({ session, subject }) {
       goToReport();
       return;
     }
+    setRecovery(null);
+    setBlocked(false);
     setIndex(nextIndex);
     setAnswer('');
     setWork('');
@@ -108,11 +161,14 @@ export default function LiveProblem({ session, subject }) {
     } catch (err) {
       fail(err, '해설을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.');
     } finally {
+      sendingRef.current = false;
       setBusy('');
     }
   }
 
   async function handleSubmit() {
+    if (sendingRef.current || blocked || checkingRecovery || recovery?.savedSubmission) return;
+    sendingRef.current = true;
     const body = { answer: answer.trim(), work: work.trim() };
     const fingerprint = `${problem.problemId}\n${body.answer}\n${body.work}`;
     if (submitRef.current?.fingerprint !== fingerprint) submitRef.current = { fingerprint, key: newKey() };
@@ -120,16 +176,7 @@ export default function LiveProblem({ session, subject }) {
     setBusy('채점하고 있어요...');
     try {
       const result = await submitAttempt(session.sessionId, problem.problemId, body, submitRef.current.key);
-      submitRef.current = null;
-      setAttempt(result);
-      setSubmittedAnswer(body.answer);
-      if (result.judgement === 'correct') {
-        await openSolution(result);
-      } else if (result.judgement === 'wrong') {
-        setPhase('wrong');
-      } else {
-        setPhase('pending');
-      }
+      await receiveGrade(result, body);
     } catch (err) {
       if (err.code === 'FIRST_ATTEMPT_ALREADY_SUBMITTED') {
         submitRef.current = null;
@@ -140,7 +187,46 @@ export default function LiveProblem({ session, subject }) {
       }
       if (!canRetrySame(err) && !isTerminal(err)) submitRef.current = null;
       fail(err, '답안을 제출하지 못했어요. 잠시 후 다시 시도해 주세요.');
+      if (err.code === 'AI_GENERATION_UNCERTAIN') {
+        setError(`AI 채점 결과를 받지 못했어요. 저장 상태를 확인한 뒤 동일 답안 재채점 여부를 선택해 주세요.${err.requestId ? ` 문의 번호: ${err.requestId}` : ''}`);
+      }
     } finally {
+      sendingRef.current = false;
+      setBusy('');
+    }
+  }
+
+  async function receiveGrade(result, body) {
+    submitRef.current = null;
+    setRecovery(null);
+    setBlocked(false);
+    setAttempt(result);
+    setSubmittedAnswer(body.answer);
+    if (result.judgement === 'correct') await openSolution(result);
+    else setPhase(result.judgement === 'wrong' ? 'wrong' : 'pending');
+  }
+
+  async function recoverGrade() {
+    if (sendingRef.current || !recovery?.savedSubmission) return;
+    const restoreOnly = ['result_available', 'completed'].includes(recovery.state);
+    if (!restoreOnly && !recovery.retryAllowed) return;
+    sendingRef.current = true;
+    setRetryOpen(false);
+    setBusy(restoreOnly ? '저장된 채점을 복원하고 있어요...' : '동일 답안을 한 번 재채점하고 있어요...');
+    setError('');
+    try {
+      const authorization = restoreOnly ? null : await consentGradingRecovery(session.sessionId, recovery.attemptId);
+      const { answer: savedAnswer, work: savedWork, idempotencyKey } = recovery.savedSubmission;
+      // Preserve the exact saved strings, request key and attempt. Do not trim or create a new key.
+      const body = { answer: savedAnswer, work: savedWork };
+      const result = await submitAttempt(session.sessionId, recovery.problemId, body, idempotencyKey, authorization?.authorizationId);
+      await receiveGrade(result, body);
+    } catch (err) {
+      fail(err, '재채점을 완료하지 못했어요. 저장 상태를 확인해 주세요.');
+      setBlocked(true);
+      setRecovery((saved) => ({ ...saved, retryAllowed: false, state: 'review_required' }));
+    } finally {
+      sendingRef.current = false;
       setBusy('');
     }
   }
@@ -173,7 +259,21 @@ export default function LiveProblem({ session, subject }) {
 
   let content = null;
   let footer;
-  const errorLine = error && <InlineError>{error}</InlineError>;
+  const errorLine = <>
+    {error && <InlineError>{error}</InlineError>}
+    {(blocked || recovery?.savedSubmission || error) && <section aria-label="채점 복구">
+      {recovery?.savedSubmission && <p>제출한 답안은 저장되어 있어요. 같은 답안과 시도 번호로 이어갑니다.</p>}
+      {recovery?.state === 'retry_available' && <p>이전 AI 요청의 결과를 받지 못했어요. 안내를 확인하고 동일 답안을 한 번 재채점할 수 있어요.</p>}
+      {recovery?.state === 'running' && <p>요청이 진행 중이에요. 자동으로 다시 요청하지 않습니다.</p>}
+      {recovery?.state === 'review_required' && <p>저장 결과 확인이 필요해요. 상태 확인으로 결과를 조회할 수 있으며 AI 요청은 보내지 않아요.</p>}
+      {recovery?.state === 'exhausted' && <p>추가 재채점 한도를 사용했어요. 답안은 보존됩니다. 지원 담당자에게 문의해 주세요.</p>}
+      <Button variant="secondary" onClick={checkRecovery} disabled={Boolean(busy) || checkingRecovery}>
+        {checkingRecovery ? '저장 상태 확인 중...' : '저장 상태 확인'}
+      </Button>
+      {recovery?.retryAllowed && <Button onClick={() => setRetryOpen(true)} disabled={Boolean(busy) || checkingRecovery}>동일 답안 재채점</Button>}
+      {['result_available', 'completed'].includes(recovery?.state) && <Button onClick={recoverGrade} disabled={Boolean(busy) || checkingRecovery}>저장된 채점 복원</Button>}
+    </section>}
+  </>;
   const showCounter = total > 0 && phase !== 'intro' && phase !== 'loading';
 
   if (phase === 'intro' || phase === 'loading') {
@@ -199,7 +299,7 @@ export default function LiveProblem({ session, subject }) {
     );
     footer = (
       <BottomCTA>
-        <Button onClick={begin} disabled={Boolean(busy) || blocked}>
+        <Button onClick={begin} disabled={Boolean(busy) || blocked || checkingRecovery}>
           {busy || '문제 풀기 시작'}
         </Button>
       </BottomCTA>
@@ -226,6 +326,7 @@ export default function LiveProblem({ session, subject }) {
           label="답"
           placeholder="답을 입력해 주세요"
           value={answer}
+          readOnly={Boolean(recovery?.savedSubmission) || blocked || Boolean(busy)}
           onChange={(event) => setAnswer(event.target.value)}
           maxLength={2000}
         />
@@ -234,6 +335,7 @@ export default function LiveProblem({ session, subject }) {
           multiline
           placeholder="계산 과정과 그렇게 푼 이유를 적어 주세요"
           value={work}
+          readOnly={Boolean(recovery?.savedSubmission) || blocked || Boolean(busy)}
           onChange={(event) => setWork(event.target.value)}
           maxLength={4000}
         />
@@ -242,7 +344,7 @@ export default function LiveProblem({ session, subject }) {
     );
     footer = (
       <BottomCTA>
-        <Button disabled={!answer.trim() || !work.trim() || Boolean(busy) || blocked} onClick={handleSubmit}>
+        <Button disabled={!answer.trim() || !work.trim() || Boolean(busy) || blocked || checkingRecovery || Boolean(recovery?.savedSubmission)} onClick={handleSubmit}>
           {busy || '답안 제출'}
         </Button>
       </BottomCTA>
@@ -278,7 +380,7 @@ export default function LiveProblem({ session, subject }) {
     );
     footer = canReteach ? (
       <BottomCTA stacked>
-        <Button onClick={handleReteach} disabled={Boolean(busy) || blocked}>
+        <Button onClick={handleReteach} disabled={Boolean(busy) || blocked || checkingRecovery}>
           {busy && busy.startsWith('AI') ? busy : 'AI 학생에게 다시 설명하기'}
         </Button>
         <Button variant="secondary" onClick={() => openSolution()} disabled={Boolean(busy)}>
@@ -365,6 +467,14 @@ export default function LiveProblem({ session, subject }) {
       footer={footer}
     >
       {content}
+      <Dialog open={retryOpen} onClose={() => setRetryOpen(false)} title="동일 답안을 다시 채점할까요?"
+        actions={<>
+          <Button variant="secondary" onClick={() => setRetryOpen(false)}>취소</Button>
+          <Button onClick={recoverGrade} disabled={Boolean(busy)}>확인하고 1회 재채점</Button>
+        </>}>
+        이전 요청이 AI에서 이미 처리됐을 수도 있어요. 다시 채점하면 추가 AI 사용량이 발생할 수 있습니다.
+        저장된 답안은 그대로 사용하며 자동 재시도는 하지 않습니다.
+      </Dialog>
       <Dialog
         open={leaveOpen}
         onClose={() => setLeaveOpen(false)}

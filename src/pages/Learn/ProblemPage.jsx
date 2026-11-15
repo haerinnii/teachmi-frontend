@@ -37,7 +37,7 @@ function initialPhase(state) {
 }
 
 export default function ProblemPage() {
-  const { live, session, loadError, subject } = useLearningSession();
+  const { live, session, loadError, subject } = useLearningSession({ verifyOnMount: true });
 
   if (!live) return <DemoProblem />;
   if (!session) return <SessionGate loadError={loadError} header={<AppBar title="응용문제" />} />;
